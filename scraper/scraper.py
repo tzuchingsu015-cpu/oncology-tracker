@@ -1,217 +1,163 @@
+"""
+Fetches top-cited oncology articles using:
+  1. PubMed E-utilities API (free, no key required for low volume)
+  2. Crossref API for citation counts
+"""
+
 import os
-import json
-import hashlib
 import time
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 import httpx
-from bs4 import BeautifulSoup
 from supabase import create_client, Client
-from sources import SOURCES
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
+HEADERS = {"User-Agent": "OncologyTracker/1.0 (mailto:tzuchingsu015@gmail.com)"}
+
+# PubMed journal search terms → maps to journal NLM IDs
+JOURNALS = [
+    {"id": "nejm",             "name": "NEJM",             "full_name": "New England Journal of Medicine", "pubmed_journal": "N Engl J Med"},
+    {"id": "jco",              "name": "JCO",              "full_name": "Journal of Clinical Oncology",    "pubmed_journal": "J Clin Oncol"},
+    {"id": "lancet_oncology",  "name": "Lancet Oncology",  "full_name": "The Lancet Oncology",            "pubmed_journal": "Lancet Oncol"},
+    {"id": "nature_cancer",    "name": "Nature Cancer",    "full_name": "Nature Cancer",                  "pubmed_journal": "Nat Cancer"},
+    {"id": "cancer_discovery", "name": "Cancer Discovery", "full_name": "Cancer Discovery (AACR)",        "pubmed_journal": "Cancer Discov"},
+    {"id": "jama_oncology",    "name": "JAMA Oncology",    "full_name": "JAMA Oncology",                  "pubmed_journal": "JAMA Oncol"},
+    {"id": "annals_oncology",  "name": "Annals of Oncology","full_name":"Annals of Oncology",             "pubmed_journal": "Ann Oncol"},
+]
+
+PERIODS = {
+    "daily":   (1,  1),   # (days back, articles per source)
+    "weekly":  (7,  3),
+    "monthly": (30, 3),
 }
 
 
-def article_id(url: str) -> str:
-    return hashlib.sha256(url.encode()).hexdigest()[:16]
+def article_id(doi_or_pmid: str) -> str:
+    return hashlib.sha256(doi_or_pmid.encode()).hexdigest()[:16]
 
 
-def fetch_html(url: str) -> Optional[str]:
+def pubmed_search(journal: str, days: int, max_results: int = 20) -> list[str]:
+    """Return list of PMIDs published in the last `days` days."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    date_range = f"{start.strftime('%Y/%m/%d')}:{end.strftime('%Y/%m/%d')}[PDAT]"
+    query = f'"{journal}"[Journal] AND {date_range}'
+
     try:
-        r = httpx.get(url, headers=HEADERS, timeout=20, follow_redirects=True)
+        r = httpx.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={"db": "pubmed", "term": query, "retmax": max_results,
+                    "retmode": "json", "sort": "pub+date"},
+            headers=HEADERS, timeout=15,
+        )
         r.raise_for_status()
-        return r.text
+        ids = r.json()["esearchresult"]["idlist"]
+        print(f"    PubMed found {len(ids)} PMIDs")
+        return ids
     except Exception as e:
-        print(f"  fetch error {url}: {e}")
-        return None
-
-
-# ── per-source parsers ─────────────────────────────────────────────────────────
-
-def parse_nejm(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    articles = []
-    for item in soup.select("li.most-popular__item")[:limit]:
-        title_el = item.select_one("a.most-popular__title")
-        if not title_el:
-            continue
-        url = "https://www.nejm.org" + title_el["href"]
-        articles.append({
-            "title": title_el.get_text(strip=True),
-            "url": url,
-            "authors": item.select_one(".author-list") and item.select_one(".author-list").get_text(strip=True) or "",
-            "abstract": "",
-        })
-    return articles
-
-
-def parse_asco_jco(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    articles = []
-    for item in soup.select("div.art_title")[:limit]:
-        a = item.select_one("a")
-        if not a:
-            continue
-        url = "https://ascopubs.org" + a["href"] if a["href"].startswith("/") else a["href"]
-        articles.append({
-            "title": a.get_text(strip=True),
-            "url": url,
-            "authors": "",
-            "abstract": "",
-        })
-    return articles
-
-
-def parse_lancet(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    articles = []
-    for item in soup.select("article.article-item")[:limit]:
-        title_el = item.select_one("h3 a, h2 a")
-        if not title_el:
-            continue
-        href = title_el.get("href", "")
-        url = "https://www.thelancet.com" + href if href.startswith("/") else href
-        articles.append({
-            "title": title_el.get_text(strip=True),
-            "url": url,
-            "authors": "",
-            "abstract": "",
-        })
-    return articles
-
-
-def parse_nature(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    articles = []
-    for item in soup.select("article")[:limit]:
-        title_el = item.select_one("h3 a, h2 a")
-        if not title_el:
-            continue
-        href = title_el.get("href", "")
-        url = "https://www.nature.com" + href if href.startswith("/") else href
-        abstract_el = item.select_one("p.article-item__teaser, div.c-article-teaser-text")
-        articles.append({
-            "title": title_el.get_text(strip=True),
-            "url": url,
-            "authors": "",
-            "abstract": abstract_el.get_text(strip=True) if abstract_el else "",
-        })
-    return articles
-
-
-def parse_asco_news(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    articles = []
-    for item in soup.select("div.news-listing__item, article.news-item")[:limit]:
-        title_el = item.select_one("h3 a, h2 a, a.news-title")
-        if not title_el:
-            continue
-        href = title_el.get("href", "")
-        url = "https://www.asco.org" + href if href.startswith("/") else href
-        articles.append({
-            "title": title_el.get_text(strip=True),
-            "url": url,
-            "authors": "",
-            "abstract": "",
-        })
-    return articles
-
-
-def parse_esmo(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    articles = []
-    for item in soup.select("div.news-item, article")[:limit]:
-        title_el = item.select_one("h3 a, h2 a, .news-title a")
-        if not title_el:
-            continue
-        href = title_el.get("href", "")
-        url = "https://www.esmo.org" + href if href.startswith("/") else href
-        articles.append({
-            "title": title_el.get_text(strip=True),
-            "url": url,
-            "authors": "",
-            "abstract": "",
-        })
-    return articles
-
-
-def parse_aacr(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    articles = []
-    for item in soup.select("div.item-page, li.js-widget-item")[:limit]:
-        title_el = item.select_one("a")
-        if not title_el:
-            continue
-        href = title_el.get("href", "")
-        url = "https://aacrjournals.org" + href if href.startswith("/") else href
-        articles.append({
-            "title": title_el.get_text(strip=True),
-            "url": url,
-            "authors": "",
-            "abstract": "",
-        })
-    return articles
-
-
-PARSERS = {
-    "nejm": parse_nejm,
-    "jco": parse_asco_jco,
-    "lancet_oncology": parse_lancet,
-    "nature_cancer": parse_nature,
-    "asco": parse_asco_news,
-    "esmo": parse_esmo,
-    "cancer_discovery": parse_aacr,
-}
-
-LIMITS = {"daily": 1, "weekly": 3, "monthly": 3}
-PERIOD_URL_KEY = {"daily": "daily_url", "weekly": "weekly_url", "monthly": "monthly_url"}
-
-
-def scrape_source(source: dict, period: str) -> list[dict]:
-    url = source[PERIOD_URL_KEY[period]]
-    limit = LIMITS[period]
-    print(f"  [{source['id']}] {period} -> {url}")
-    html = fetch_html(url)
-    if not html:
+        print(f"    PubMed search error: {e}")
         return []
-    parser = PARSERS.get(source["id"])
-    if not parser:
+
+
+def pubmed_fetch(pmids: list[str]) -> list[dict]:
+    """Fetch article metadata for a list of PMIDs."""
+    if not pmids:
         return []
-    raw = parser(html, limit)
+    try:
+        r = httpx.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            params={"db": "pubmed", "id": ",".join(pmids), "retmode": "json"},
+            headers=HEADERS, timeout=15,
+        )
+        r.raise_for_status()
+        result = r.json().get("result", {})
+        articles = []
+        for pmid in pmids:
+            item = result.get(pmid, {})
+            if not item or item.get("uid") != pmid:
+                continue
+            doi = next((loc["value"] for loc in item.get("articleids", [])
+                        if loc.get("idtype") == "doi"), None)
+            authors = ", ".join(
+                a.get("name", "") for a in item.get("authors", [])[:3]
+            )
+            if len(item.get("authors", [])) > 3:
+                authors += " et al."
+            articles.append({
+                "pmid": pmid,
+                "doi": doi,
+                "title": item.get("title", "").rstrip("."),
+                "authors": authors,
+                "pub_date": item.get("pubdate", ""),
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+            })
+        return articles
+    except Exception as e:
+        print(f"    PubMed fetch error: {e}")
+        return []
+
+
+def get_citation_count(doi: str) -> int:
+    """Get citation count from Crossref API."""
+    if not doi:
+        return 0
+    try:
+        r = httpx.get(
+            f"https://api.crossref.org/works/{doi}",
+            headers=HEADERS, timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("message", {}).get("is-referenced-by-count", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def scrape_journal(journal: dict, period: str) -> list[dict]:
+    days, limit = PERIODS[period]
+    print(f"  [{journal['id']}] {period} (past {days}d)")
+
+    # fetch more candidates than needed so we can sort by citations
+    pmids = pubmed_search(journal["pubmed_journal"], days, max_results=30)
+    time.sleep(0.4)  # respect NCBI rate limit (3 req/s without API key)
+
+    articles = pubmed_fetch(pmids)
+    time.sleep(0.4)
+
+    # get citation counts (Crossref) — only for candidates
+    for art in articles:
+        art["citations"] = get_citation_count(art["doi"]) if art["doi"] else 0
+        time.sleep(0.2)
+
+    # sort by citations descending, take top N
+    articles.sort(key=lambda a: a["citations"], reverse=True)
+    top = articles[:limit]
+
     now = datetime.now(timezone.utc).isoformat()
     results = []
-    for rank, art in enumerate(raw, start=1):
-        if not art["title"] or not art["url"]:
-            continue
+    for rank, art in enumerate(top, start=1):
+        uid = art["doi"] or art["pmid"]
         results.append({
-            "id": article_id(art["url"]),
-            "source_id": source["id"],
-            "source_name": source["name"],
+            "id": article_id(uid),
+            "source_id": journal["id"],
+            "source_name": journal["name"],
             "title": art["title"],
             "url": art["url"],
-            "authors": art.get("authors", ""),
-            "abstract": art.get("abstract", ""),
+            "authors": art["authors"],
+            "abstract": "",
             "period": period,
             "rank": rank,
             "scraped_at": now,
         })
+        print(f"    #{rank} [{art['citations']} citations] {art['title'][:60]}…")
     return results
 
 
 def deduplicate(daily: list, weekly: list, monthly: list):
-    """Articles in daily are excluded from weekly; daily+weekly excluded from monthly."""
     daily_urls = {a["url"] for a in daily}
     weekly_clean = [a for a in weekly if a["url"] not in daily_urls]
     weekly_monthly_urls = daily_urls | {a["url"] for a in weekly_clean}
@@ -219,37 +165,32 @@ def deduplicate(daily: list, weekly: list, monthly: list):
     return daily, weekly_clean, monthly_clean
 
 
-def upsert_articles(articles: list[dict]):
-    if not articles:
-        return
-    # delete today's entries for the same source+period, then insert fresh
-    for art in articles:
-        supabase.table("articles").upsert(art, on_conflict="id,period").execute()
-    print(f"  upserted {len(articles)} articles")
-
-
 def run():
     print(f"=== scrape run at {datetime.now(timezone.utc).isoformat()} ===")
-    for source in SOURCES:
-        print(f"\n{source['name']}")
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    for journal in JOURNALS:
+        print(f"\n{journal['full_name']}")
         daily, weekly, monthly = [], [], []
+
         for period in ("daily", "weekly", "monthly"):
-            arts = scrape_source(source, period)
+            arts = scrape_journal(journal, period)
             if period == "daily":
                 daily = arts
             elif period == "weekly":
                 weekly = arts
             else:
                 monthly = arts
-            time.sleep(2)
 
         daily, weekly, monthly = deduplicate(daily, weekly, monthly)
         all_arts = daily + weekly + monthly
 
-        # clear today's records for this source before upserting
-        today = datetime.now(timezone.utc).date().isoformat()
-        supabase.table("articles").delete().eq("source_id", source["id"]).gte("scraped_at", today).execute()
-        upsert_articles(all_arts)
+        if all_arts:
+            supabase.table("articles").delete().eq("source_id", journal["id"]).gte("scraped_at", today).execute()
+            supabase.table("articles").upsert(all_arts, on_conflict="id,period").execute()
+            print(f"  → saved {len(all_arts)} articles")
+        else:
+            print(f"  → no articles found")
 
     print("\n=== done ===")
 
