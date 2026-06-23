@@ -8,13 +8,16 @@ import os
 import time
 import hashlib
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 import httpx
-from supabase import create_client, Client
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPA_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates",
+}
 
 HEADERS = {"User-Agent": "OncologyTracker/1.0 (mailto:tzuchingsu015@gmail.com)"}
 
@@ -157,6 +160,30 @@ def scrape_journal(journal: dict, period: str) -> list[dict]:
     return results
 
 
+def supa_delete_today(source_id: str, today: str):
+    r = httpx.delete(
+        f"{SUPABASE_URL}/rest/v1/articles",
+        headers=SUPA_HEADERS,
+        params={"source_id": f"eq.{source_id}", "scraped_at": f"gte.{today}"},
+        timeout=15,
+    )
+    if r.status_code not in (200, 204):
+        print(f"  delete warning: {r.status_code} {r.text[:100]}")
+
+
+def supa_upsert(articles: list[dict]):
+    r = httpx.post(
+        f"{SUPABASE_URL}/rest/v1/articles",
+        headers={**SUPA_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+        json=articles,
+        timeout=20,
+    )
+    if r.status_code not in (200, 201, 204):
+        print(f"  upsert error: {r.status_code} {r.text[:200]}")
+        return False
+    return True
+
+
 def deduplicate(daily: list, weekly: list, monthly: list):
     daily_urls = {a["url"] for a in daily}
     weekly_clean = [a for a in weekly if a["url"] not in daily_urls]
@@ -186,9 +213,9 @@ def run():
         all_arts = daily + weekly + monthly
 
         if all_arts:
-            supabase.table("articles").delete().eq("source_id", journal["id"]).gte("scraped_at", today).execute()
-            supabase.table("articles").upsert(all_arts, on_conflict="id,period").execute()
-            print(f"  → saved {len(all_arts)} articles")
+            supa_delete_today(journal["id"], today)
+            ok = supa_upsert(all_arts)
+            print(f"  → {'saved' if ok else 'FAILED to save'} {len(all_arts)} articles")
         else:
             print(f"  → no articles found")
 
