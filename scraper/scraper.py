@@ -172,14 +172,15 @@ def supa_delete_today(source_id: str, today: str):
 
 
 def supa_upsert(articles: list[dict]):
+    url = f"{SUPABASE_URL}/rest/v1/articles"
     r = httpx.post(
-        f"{SUPABASE_URL}/rest/v1/articles",
+        url,
         headers={**SUPA_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
         json=articles,
         timeout=20,
     )
+    print(f"  upsert status={r.status_code} body={r.text[:100]!r}")
     if r.status_code not in (200, 201, 204):
-        print(f"  upsert error: {r.status_code} {r.text[:200]}")
         return False
     return True
 
